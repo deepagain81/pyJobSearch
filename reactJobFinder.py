@@ -6,18 +6,27 @@ Outputs:
   1) CSV file with columns: Company | Career portal link | Job title | Location
   2) Printed Markdown table (top N rows) to stdout
 
+What’s new in this version:
+- Added **Google Programmable Search (Custom Search JSON API)** discovery (FREE: 100 queries/day).
+  Set env vars: GOOGLE_CSE_KEY and GOOGLE_CSE_CX
+- Keeps SerpAPI, Bing (if keys present) and a robots-aware DuckDuckGo HTML *fallback*.
+- Still prefers official ATS endpoints (Greenhouse, Lever) and uses JSON-LD for Workday/Ashby/SmartRecruiters.
+
 Providers & strategy:
 - Prefer official/public endpoints when available:
   • Greenhouse  -> https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true
   • Lever       -> https://api.lever.co/v0/postings/{company}?mode=json
-  • SmartRecruiters -> JSON-LD present on posting pages (and public API exists per-company)
-  • Ashby / Workday -> parse JSON-LD on posting pages
-- Discovery via search (limited to ATS domains). Uses, in order of availability:
-  • Bing Web Search API (env: BING_API_KEY)
-  • SerpAPI (env: SERPAPI_KEY)
-  • DuckDuckGo HTML fallback (only if robots.txt allows)
-- Respect robots.txt for every host before fetching.
+  • Workday / Ashby / SmartRecruiters -> parse JSON-LD on posting pages
+- Discovery via search (limited to ATS domains), in this priority:
+  1) Google CSE (env: GOOGLE_CSE_KEY, GOOGLE_CSE_CX) — FREE tier
+  2) SerpAPI (env: SERPAPI_KEY)
+  3) Bing Web Search (env: BING_API_KEY)
+  4) DuckDuckGo HTML fallback (only if robots.txt allows)
+
+Ethics & safety:
+- Respects robots.txt for every host before fetching HTML/JSON from sites.
 - Polite rate limiting + retries with exponential backoff.
+- Identifying User-Agent.
 - Only uses stdlib + requests + beautifulsoup4 + pandas.
 
 CLI:
@@ -67,7 +76,7 @@ SEARCH_QUERY_DOMAINS = [
 ]
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; ReactJobsFinder/1.0; +https://example.com)"
+    "Mozilla/5.0 (compatible; ReactJobsFinder/1.1; +https://example.com)"
 )
 
 REQUEST_TIMEOUT = 20  # seconds
@@ -117,7 +126,7 @@ def is_allowed_by_robots(session: requests.Session, url: str, user_agent: str) -
             if resp.status_code == 200:
                 rp.parse(resp.text.splitlines())
             else:
-                # If robots.txt missing or error, default to allowing (conservative alternative would be disallow).
+                # If robots.txt missing or error, default to allowing (or choose to disallow if you prefer stricter behavior).
                 rp.parse([])
         except requests.RequestException:
             rp.parse([])
@@ -206,17 +215,48 @@ def build_search_query(keywords: List[str]) -> str:
     return f"({kq}) ({dq})"
 
 
+def search_google_cse(session: requests.Session, query: str, limit: int) -> List[str]:
+    """
+    Google Programmable Search Engine (Custom Search JSON API)
+    Env vars:
+      - GOOGLE_CSE_KEY : API key
+      - GOOGLE_CSE_CX  : Search engine ID (must be configured to search ATS domains)
+    """
+    key = os.getenv("GOOGLE_CSE_KEY")
+    cx = os.getenv("GOOGLE_CSE_CX")
+    if not key or not cx:
+        return []
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+    urls: List[str] = []
+    start = 1
+    per_page = 10
+    # paginate up to 'limit', 10 per page
+    while len(urls) < limit and start <= 100:  # API caps start<=100
+        params = {"key": key, "cx": cx, "q": query, "num": min(per_page, limit - len(urls)), "start": start}
+        try:
+            r = session.get(endpoint, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            items = data.get("items", []) if isinstance(data, dict) else []
+            batch = [it.get("link") for it in items if it.get("link")]
+            for u in batch:
+                if u and is_allowed_domain(u):
+                    urls.append(u)
+            if not items:
+                break
+            start += per_page
+        except requests.RequestException:
+            break
+    return urls
+
+
 def search_bing(session: requests.Session, query: str, limit: int) -> List[str]:
     api_key = os.getenv("BING_API_KEY")
     if not api_key:
         return []
     endpoint = "https://api.bing.microsoft.com/v7.0/search"
-    params = {
-        "q": query,
-        "count": min(limit, 50),
-        "responseFilter": "Webpages",
-        "safeSearch": "Moderate",
-    }
+    params = {"q": query, "count": min(limit, 50), "responseFilter": "Webpages", "safeSearch": "Moderate"}
     headers = {"Ocp-Apim-Subscription-Key": api_key, "User-Agent": DEFAULT_USER_AGENT}
     try:
         r = session.get(endpoint, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -235,13 +275,7 @@ def search_serpapi(session: requests.Session, query: str, limit: int) -> List[st
     if not api_key:
         return []
     endpoint = "https://serpapi.com/search.json"
-    # Use Google engine with domain filters inside the query
-    params = {
-        "engine": "google",
-        "q": query,
-        "num": min(limit, 50),
-        "api_key": api_key,
-    }
+    params = {"engine": "google", "q": query, "num": min(limit, 50), "api_key": api_key}
     try:
         r = session.get(endpoint, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -278,8 +312,8 @@ def search_duckduckgo_html(session: requests.Session, query: str, limit: int) ->
 def discover_posting_urls(session: requests.Session, keywords: List[str], limit: int) -> List[str]:
     query = build_search_query(keywords)
     urls: List[str] = []
-    # Try providers in order
-    for fn in (search_bing, search_serpapi, search_duckduckgo_html):
+    # Priority: Google CSE (free) -> SerpAPI -> Bing -> DDG HTML
+    for fn in (search_google_cse, search_serpapi, search_bing, search_duckduckgo_html):
         try:
             results = fn(session, query, limit * 3)  # oversample a bit
             urls.extend(results)
@@ -357,7 +391,6 @@ def parse_lever_company_jobs(
     jobs = []
     company = slug_to_company(slug)
     for item in data:
-        # title fields vary across Lever tenants
         title = (
             item.get("text")
             or item.get("title")
@@ -366,13 +399,11 @@ def parse_lever_company_jobs(
         )
         if not title or not kw_re.search(str(title)):
             continue
-        # location might be under categories.location, or "workplaceType"/"country"
         loc = ""
         cats = item.get("categories") or {}
         if isinstance(cats, dict):
             loc = cats.get("location") or ""
         if not loc:
-            # fallback strings
             loc = item.get("country") or item.get("workplaceType") or ""
         link = item.get("hostedUrl") or item.get("applyUrl") or item.get("url") or ""
         if link:
@@ -416,7 +447,6 @@ def parse_jsonld_jobposting(html: str) -> Optional[Tuple[str, str, str]]:
                         parts = [addr.get("addressLocality"), addr.get("addressRegion"), addr.get("addressCountry")]
                         location = ", ".join([p for p in parts if p])
                 if not location:
-                    # Try jobLocationType: "TELECOMMUTE"
                     jtype = d.get("jobLocationType")
                     if isinstance(jtype, str) and jtype:
                         location = jtype
@@ -439,7 +469,6 @@ def parse_generic_page(
         comp = company or slug_to_company(first_path_segment(url))
         return [JobPosting(company=comp, link=url, title=title, location=location or "")]
     return []
-
 
 # -------------------------- Orchestrator -------------------------------
 
@@ -478,13 +507,11 @@ def harvest_jobs(
                 # Workday / Ashby / SmartRecruiters / unknown -> parse page via JSON-LD
                 out.extend(parse_generic_page(session, url, kw_re))
         except Exception:
-            # be resilient; skip bad entries
             continue
 
-        # rate limit between sources
+        # polite spacing between requests
         time.sleep(BASE_SLEEP * 0.6)
 
-        # stop if we have enough
         if len(out) >= limit:
             break
 
@@ -505,7 +532,6 @@ def write_csv(rows: List[JobPosting], out_path: str) -> None:
                         "Job title": r.title,
                         "Location": r.location} for r in rows])
     df.to_csv(out_path, index=False)
-
 
 # -------------------------- Main --------------------------------------
 
@@ -536,11 +562,11 @@ def main() -> None:
     args = parse_args()
     session = make_session()
 
-    # 1) Discover candidate posting URLs using the best available search backend
+    # 1) Discover candidate posting URLs using available search backends
     discovered = discover_posting_urls(session, args.keywords, args.limit)
     if not discovered:
         print("No postings discovered via search (check API keys or network).", file=sys.stderr)
-        print("Tip: set BING_API_KEY or SERPAPI_KEY in environment for stronger discovery.", file=sys.stderr)
+        print("Tip: set GOOGLE_CSE_KEY/GOOGLE_CSE_CX (free 100/day) or SERPAPI_KEY. BING_API_KEY optional.", file=sys.stderr)
         sys.exit(2)
 
     # 2) Harvest jobs using provider APIs (Greenhouse/Lever) or page JSON-LD fallbacks
@@ -565,13 +591,15 @@ if __name__ == "__main__":
 """
 USAGE
 
-1) (Optional) Set a search API key for better discovery:
-   - Bing Web Search API:
-       export BING_API_KEY="YOUR_KEY"
-   - or SerpAPI:
-       export SERPAPI_KEY="YOUR_KEY"
+1) Choose a discovery backend (free-first):
+   - **Google Programmable Search (Custom Search JSON API)** — FREE 100 queries/day
+       export GOOGLE_CSE_KEY="your_api_key"
+       export GOOGLE_CSE_CX="your_search_engine_id"  # configure to search only ATS domains
+   - Optional fallbacks:
+       export SERPAPI_KEY="your_key"     # 250/mo free on SerpAPI
+       export BING_API_KEY="your_key"    # if you still have access
 
-   The script *only* searches these ATS domains:
+   This script *only* searches these ATS domains:
      boards.greenhouse.io, jobs.lever.co, myworkdayjobs.com, ashbyhq.com, smartrecruiters.com
 
 2) Install dependencies (Python 3.9+ recommended):
@@ -590,8 +618,12 @@ USAGE
    - Prints a Markdown table (top N) to stdout.
 
 Ethical scraping safeguards built-in:
-   - Respects robots.txt for every host before fetching.
+   - Respects robots.txt for every host before fetching HTML/JSON.
    - Uses official/public ATS endpoints where available (Greenhouse, Lever).
    - Polite rate limiting and bounded retries with backoff.
    - Clear User-Agent string.
+
+Notes:
+- **Google CSE setup**: Create a Programmable Search Engine, add the ATS domains, enable the Custom Search JSON API in your GCP project, and copy `key` + `cx`.
+- Keep keys out of source control; use env vars or a local `.env` ignored by git.
 """
