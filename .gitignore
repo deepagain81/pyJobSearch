@@ -19,4 +19,5 @@ config.py
 
 #others
 .DS_Store
+.csv
 
