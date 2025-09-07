@@ -3,29 +3,33 @@
 react_jobs_finder.py — Find CURRENT “React” / “React Native” job openings from common ATS providers.
 
 Outputs:
-  1) CSV file with columns: Company | Job title | Location | Career portal link
-  2) Printed Markdown table (top N rows) to stdout
+1) CSV file with columns: Company | Job title | Location | Career portal link
 
-What’s new in this refactor:
-- All static constants are sourced from env/.env (no in-script defaults for config).
-- Logging & debug utilities moved to debug_constants.py.
+What’s in this script:
+Providers & strategy:
+- Discovery via search (limited to ATS domains).
+- Respect robots.txt for every host before fetching.
+- Polite rate limiting + retries with exponential backoff.
+- Only uses stdlib + requests + beautifulsoup4 + pandas.
+- All static constants are sourced from .env.
+- Logging & debug utilities are in debug_constants.py.
 - Debugger mode (--debug=true|false) + milestone logs via debug_constants.
 
 Discovery priority:
 - Google CSE (free 100/day) → SerpAPI fallback.
 - Uses official/public ATS where possible (Greenhouse, Lever, Ashby; SmartRecruiters if token provided),
-  otherwise a single-page JSON-LD parse (e.g., Workday).
+otherwise a single-page JSON-LD parse (e.g., Workday).
 
 CLI:
-  --keywords   (repeatable; default: ["React", "React Native"])
-  --limit      (max number of rows to output; default: 50)
-  --out        (CSV output path; default: ./react_jobs.csv)
-  --quiet      (suppress milestone logs)
-  --progress   (force-enable milestone logs; default behavior)
-  --debug      (true|false; default: false) → enables verbose debug logs & tracebacks
+--keywords   (repeatable; default: ["React", "React Native"])
+--limit      (max number of rows to output; default: 10)
+--out        (CSV output path; default: ./jobs_{date}.csv)
+--quiet      (suppress milestone logs)
+--progress   (force-enable milestone logs; default behavior)
+--debug      (true|false; default: false) → enables verbose debug logs & tracebacks
 
 Example:
-  python3 react_jobs_finder.py --keywords React "React Native" --limit 40 --out jobs.csv --debug=true
+python3 react_jobs_finder.py --keywords React "React Native" --limit 40 --out jobs_{date}.csv --debug=true
 """
 
 from __future__ import annotations
@@ -297,12 +301,6 @@ def safe_get_html(session: requests.Session, url: str, headers: Dict[str, str]) 
             sleep_with_backoff(attempt)
     return None
 
-# def to_markdown_table(rows: List[JobPosting], limit: int) -> str:
-#     cols = ["Company", "Career portal link", "Job title", "Location"]
-#     head = "| " + " | ".join(cols) + " |"
-#     sep = "| " + " | ".join(["---"] * len(cols)) + " |"
-#     body = [f"| {r.company} | {r.link} | {r.title} | {r.location} |" for r in rows[:limit]]
-#     return "\n".join([head, sep] + body)
 
 def normalize_domain(url: str) -> str:
     return urlparse(url).netloc.lower()
@@ -693,10 +691,6 @@ def main() -> None:
     out_path = expand_out_path(args.out, OUT_TZ, OUT_DATE_FMT)
     write_csv(rows, out_path)
 
-    # Print markdown table to stdout (capped by --limit)
-    # with step("PRINT TABLE"):
-    #     print(to_markdown_table(rows, min(len(rows), args.limit)))
-
     log("DONE ✅")
     log(f"Saved CSV: {out_path}")
 
@@ -717,29 +711,12 @@ USAGE
        GOOGLE_CSE_CX=your_google_cx
        SERPAPI_KEY=your_serpapi_key
 
-       # Optional SmartRecruiters token (if you have one)
-       SMARTRECRUITERS_TOKEN=your_smart_token
-
-       # Domains (comma-separated)
-       ATS_ALLOWED_DOMAINS=boards.greenhouse.io,jobs.lever.co,myworkdayjobs.com,ashbyhq.com,smartrecruiters.com,www.smartrecruiters.com,careers.smartrecruiters.com
-       ATS_SEARCH_DOMAINS=boards.greenhouse.io,jobs.lever.co,myworkdayjobs.com,ashbyhq.com,smartrecruiters.com
-
-       # Official API URL templates (override only if needed)
-       GREENHOUSE_API_TEMPLATE=https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true
-       LEVER_API_TEMPLATE=https://api.lever.co/v0/postings/{company}?mode=json
-       ASHBY_API_TEMPLATE=https://api.ashbyhq.com/posting-api/job-board/{board}
-       SMARTRECRUITERS_API_TEMPLATE=https://api.smartrecruiters.com/v1/companies/{company}/postings?limit=100&offset=0
-
-       # Politeness / runtime
-       JOBS_USER_AGENT=ReactJobsFinderBot/1.4 (+https://yourdomain.example/jobsfinder; contact: mailto:you@example.com)
-       REQUEST_TIMEOUT_SECONDS=20
-       BASE_SLEEP_SECONDS=1.0
 
 1) Install dependencies (Python 3.9+):
    pip install requests beautifulsoup4 pandas
 
 2) Run (progress on stderr, results to stdout):
-   python3 react_jobs_finder.py --keywords React "React Native" --limit 50 --out jobs.csv
+   python3 react_jobs_finder.py --keywords React "React Native" --limit 50 --out jobs_{date}.csv
 
 3) Debugger mode (more logs + tracebacks):
    python3 react_jobs_finder.py --debug=true --limit 20
@@ -748,6 +725,5 @@ USAGE
    python3 react_jobs_finder.py --quiet --limit 50
 
 Output:
-- CSV file: Company | Career portal link | Job title | Location
-- Markdown table printed to stdout (clean to pipe into README/notes).
+- CSV file: Company | Job title | Location | Career portal link 
 """
