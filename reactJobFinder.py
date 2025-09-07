@@ -645,7 +645,7 @@ def write_csv(rows: List[JobPosting], out_path: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     # Defaults are env-driven to avoid in-script constants
-    default_limit = int(os.environ.get("DEFAULT_LIMIT", "50"))
+    default_limit = int(os.environ.get("DEFAULT_LIMIT"))
     default_out_template = _require("DEFAULT_OUT_PATH")
     default_keywords = [x.strip() for x in os.environ.get("DEFAULT_KEYWORDS", "React,React Native").split(",") if x.strip()]
 
