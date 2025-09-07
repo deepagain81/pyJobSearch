@@ -7,11 +7,15 @@ Outputs:
   2) Printed Markdown table (top N rows) to stdout
 
 What’s new in this refactor:
-- **Milestone progress output** to the terminal (stderr) so you can see the script’s progression.
-  Use `--quiet` to suppress, or keep default to show progress.
-- Keeps secrets/config in a local `.env` (ignored by git) or environment variables.
-- Discovery priority: **Google CSE (free 100/day)** → **SerpAPI** fallback.
-- Uses **official/public ATS** where possible (Greenhouse, Lever, Ashby; SmartRecruiters if token provided),
+- Milestone progress output to the terminal (stderr) so you can see the script’s progression (already added).
+- **Debugger mode** via `--debug=true|false` to pinpoint where errors occur:
+    • Logs step START/END with durations
+    • Includes request URLs, response codes, retry/backoff details
+    • On exceptions, prints full tracebacks to stderr
+
+Discovery priority:
+- Google CSE (free 100/day) → SerpAPI fallback.
+- Uses official/public ATS where possible (Greenhouse, Lever, Ashby; SmartRecruiters if token provided),
   otherwise a single-page JSON-LD parse (e.g., Workday).
 
 CLI:
@@ -20,9 +24,10 @@ CLI:
   --out        (CSV output path; default: ./react_jobs.csv)
   --quiet      (suppress milestone logs)
   --progress   (force-enable milestone logs; default behavior)
+  --debug      (true|false; default: false) → enables verbose debug logs & tracebacks
 
 Example:
-  python3 react_jobs_finder.py --keywords React "React Native" --limit 40 --out jobs.csv
+  python3 react_jobs_finder.py --keywords React "React Native" --limit 40 --out jobs.csv --debug=true
 """
 from __future__ import annotations
 
@@ -32,6 +37,8 @@ import os
 import re
 import sys
 import time
+import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlencode
@@ -46,9 +53,8 @@ from bs4 import BeautifulSoup
 def load_dotenv(path: str = ".env", override: bool = False) -> bool:
     """
     Minimal .env loader (no dependencies).
-    - Lines like KEY=VALUE (quotes optional) are supported.
-    - Ignores blank lines and lines starting with #.
-    - By default, existing environment variables WIN; set override=True to overwrite.
+    - KEY=VALUE (quotes optional); ignores blank/# lines.
+    - Existing environment variables win unless override=True.
     Returns True if a file was loaded, else False.
     """
     try:
@@ -68,7 +74,6 @@ def load_dotenv(path: str = ".env", override: bool = False) -> bool:
     except FileNotFoundError:
         return False
 
-# Load .env early so os.environ is populated before reading config
 ENV_LOADED = load_dotenv()
 
 # ============================ Config via ENV ===========================
@@ -140,7 +145,7 @@ SMARTRECRUITERS_API_TEMPLATE = _getenv(
 # Other runtime knobs
 DEFAULT_USER_AGENT = _getenv(
     "JOBS_USER_AGENT",
-    "ReactJobsFinderBot/1.3 (+https://yourdomain.example/jobsfinder; contact: mailto:you@example.com)"
+    "ReactJobsFinderBot/1.4 (+https://yourdomain.example/jobsfinder; contact: mailto:you@example.com)"
 )
 REQUEST_TIMEOUT = _getenv_int("REQUEST_TIMEOUT_SECONDS", 20)
 BASE_SLEEP = _getenv_float("BASE_SLEEP_SECONDS", 1.0)
@@ -151,15 +156,46 @@ GOOGLE_CSE_CX = os.environ.get("GOOGLE_CSE_CX", "")
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 SMARTRECRUITERS_TOKEN = os.environ.get("SMARTRECRUITERS_TOKEN", "")
 
-# ============================ Progress logger ==========================
+# ============================ Progress / Debug =========================
 
-PROGRESS = True  # default; will be set by CLI flags later
+PROGRESS = True   # set by CLI
+DEBUG = False     # set by CLI
+
+def parse_bool(s: Optional[str]) -> bool:
+    if s is None:
+        return False
+    return str(s).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 def log(msg: str) -> None:
     """Milestone logger to stderr with HH:MM:SS timestamps."""
-    if PROGRESS:
+    if PROGRESS or DEBUG:
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] {msg}", file=sys.stderr)
+
+def dlog(msg: str) -> None:
+    """Verbose debug logger."""
+    if DEBUG:
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] [DEBUG] {msg}", file=sys.stderr)
+
+@contextmanager
+def step(title: str):
+    """Context manager to log step start/end and capture tracebacks when --debug=true."""
+    log(f"▶ {title} — start")
+    t0 = time.time()
+    try:
+        yield
+    except SystemExit:
+        # Let sys.exit() propagate without masking
+        raise
+    except Exception as e:
+        log(f"✖ {title} — ERROR: {e}")
+        if DEBUG:
+            traceback.print_exc(file=sys.stderr)
+        raise
+    else:
+        dt = time.time() - t0
+        log(f"✔ {title} — done in {dt:.2f}s")
 
 # ============================ Data model ===============================
 
@@ -195,16 +231,17 @@ def is_allowed_by_robots(session: requests.Session, url: str, user_agent: str) -
     if rp is None:
         rp = robotparser.RobotFileParser()
         try:
+            dlog(f"Fetching robots.txt: {robots_url}")
             resp = session.get(robots_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": user_agent})
             if resp.status_code == 200:
                 rp.parse(resp.text.splitlines())
-                log(f"robots.txt loaded for {parsed.netloc}")
+                dlog(f"robots.txt loaded for {parsed.netloc}")
             else:
                 rp.parse([])
                 log(f"robots.txt unavailable ({resp.status_code}) for {parsed.netloc}; proceeding cautiously")
-        except requests.RequestException:
+        except requests.RequestException as e:
             rp.parse([])
-            log(f"robots.txt fetch failed for {parsed.netloc}; proceeding cautiously")
+            log(f"robots.txt fetch failed for {parsed.netloc}; proceeding cautiously ({e})")
         cache[robots_url] = rp
 
     allowed = rp.can_fetch(user_agent, url)
@@ -220,11 +257,12 @@ def sleep_with_backoff(attempt: int) -> None:
 def safe_get_json(session: requests.Session, url: str, headers: Dict[str, str]) -> Optional[dict]:
     for attempt in range(4):
         try:
+            dlog(f"GET JSON: {url}")
             r = session.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
+            dlog(f"→ status {r.status_code}")
             if r.status_code == 200:
                 return r.json()
             elif r.status_code in (429, 500, 502, 503, 504):
-                log(f"JSON fetch retryable status {r.status_code} for {url}")
                 sleep_with_backoff(attempt)
                 continue
             else:
@@ -240,11 +278,12 @@ def safe_get_html(session: requests.Session, url: str, headers: Dict[str, str]) 
         try:
             if not is_allowed_by_robots(session, url, headers.get("User-Agent", DEFAULT_USER_AGENT)):
                 return None
+            dlog(f"GET HTML: {url}")
             r = session.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
+            dlog(f"→ status {r.status_code} content-type {r.headers.get('Content-Type')}")
             if r.status_code == 200 and "text/html" in r.headers.get("Content-Type", ""):
                 return r.text
             elif r.status_code in (429, 500, 502, 503, 504):
-                log(f"HTML fetch retryable status {r.status_code} for {url}")
                 sleep_with_backoff(attempt)
                 continue
             else:
@@ -305,7 +344,9 @@ def search_google_cse(session: requests.Session, query: str, limit: int) -> List
     while len(urls) < limit and start <= 100:
         params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": min(per_page, limit - len(urls)), "start": start}
         try:
+            dlog(f"CSE request start={start} q={query}")
             r = session.get(endpoint, params=params, timeout=REQUEST_TIMEOUT)
+            dlog(f"CSE status {r.status_code}")
             if r.status_code != 200:
                 log(f"Google CSE returned status {r.status_code}")
                 break
@@ -333,7 +374,9 @@ def search_serpapi(session: requests.Session, query: str, limit: int) -> List[st
     params = {"engine": "google", "q": query, "num": min(limit, 50), "api_key": SERPAPI_KEY}
     log("Discovery: SerpAPI fallback → querying…")
     try:
+        dlog(f"SerpAPI request q={query}")
         r = session.get(endpoint, params=params, timeout=REQUEST_TIMEOUT)
+        dlog(f"SerpAPI status {r.status_code}")
         if r.status_code == 200:
             data = r.json()
             items = data.get("organic_results", [])
@@ -349,31 +392,33 @@ def search_serpapi(session: requests.Session, query: str, limit: int) -> List[st
 
 def discover_posting_urls(session: requests.Session, keywords: List[str], limit: int) -> List[str]:
     query = build_search_query(keywords)
-    log("========== DISCOVERY ==========")
-    log(f"Keywords: {keywords}")
-    log(f"Search domains: {ATS_SEARCH_DOMAINS}")
-    log(f"Built query: {query}")
-    urls: List[str] = []
-    for fn in (search_google_cse, search_serpapi):
-        try:
-            results = fn(session, query, limit * 3)  # oversample
-            urls.extend(results)
-        except Exception as e:
-            log(f"Discovery function error: {e}")
-            continue
-        if len(urls) >= limit * 2:
-            break
-    # Deduplicate, keep order
-    seen: Set[str] = set()
-    deduped: List[str] = []
-    for u in urls:
-        if u not in seen and is_allowed_domain(u):
-            deduped.append(u)
-            seen.add(u)
-        if len(deduped) >= limit * 2:
-            break
-    log(f"Discovery: found {len(urls)} candidates → {len(deduped)} after dedupe/filter")
-    return deduped
+    with step("DISCOVERY"):
+        log(f"Keywords: {keywords}")
+        log(f"Search domains: {ATS_SEARCH_DOMAINS}")
+        log(f"Built query: {query}")
+        urls: List[str] = []
+        for fn in (search_google_cse, search_serpapi):
+            try:
+                results = fn(session, query, limit * 3)  # oversample
+                urls.extend(results)
+            except Exception as e:
+                log(f"Discovery function error: {e}")
+                if DEBUG:
+                    traceback.print_exc(file=sys.stderr)
+                continue
+            if len(urls) >= limit * 2:
+                break
+        # Deduplicate, keep order
+        seen: Set[str] = set()
+        deduped: List[str] = []
+        for u in urls:
+            if u not in seen and is_allowed_domain(u):
+                deduped.append(u)
+                seen.add(u)
+            if len(deduped) >= limit * 2:
+                break
+        log(f"Discovery: found {len(urls)} candidates → {len(deduped)} after dedupe/filter")
+        return deduped
 
 # ===================== Provider detection & parsers ====================
 
@@ -568,107 +613,111 @@ def parse_generic_page(session: requests.Session, url: str, kw_re: re.Pattern) -
 # ============================ Orchestrator ============================
 
 def harvest_jobs(session: requests.Session, discovered_urls: List[str], keywords: List[str], limit: int) -> List[JobPosting]:
-    kw_re = build_keyword_regex(keywords)
-    out: List[JobPosting] = []
+    with step("HARVEST"):
+        kw_re = build_keyword_regex(keywords)
+        out: List[JobPosting] = []
 
-    processed_company_slugs: Dict[str, Set[str]] = {
-        "greenhouse": set(),
-        "lever": set(),
-        "ashby": set(),
-        "smartrecruiters": set(),
-    }
+        processed_company_slugs: Dict[str, Set[str]] = {
+            "greenhouse": set(),
+            "lever": set(),
+            "ashby": set(),
+            "smartrecruiters": set(),
+        }
 
-    counts = {"greenhouse": 0, "lever": 0, "ashby": 0, "smartrecruiters": 0, "generic": 0}
+        counts = {"greenhouse": 0, "lever": 0, "ashby": 0, "smartrecruiters": 0, "generic": 0}
 
-    log("========== HARVEST ==========")
-    log(f"Limit: {limit} | Keywords: {keywords} | UA: {DEFAULT_USER_AGENT}")
-    for url in discovered_urls:
-        if len(out) >= limit:
-            break
-        provider = detect_provider(url)
-        try:
-            if provider == "greenhouse":
-                slug = first_path_segment(url)
-                if slug and slug not in processed_company_slugs["greenhouse"]:
-                    rows = parse_greenhouse_company_jobs(session, url, kw_re)
-                    processed_company_slugs["greenhouse"].add(slug)
-                    out.extend(rows)
-                    counts["greenhouse"] += len(rows)
+        log(f"Limit: {limit} | Keywords: {keywords} | UA: {DEFAULT_USER_AGENT}")
+        for url in discovered_urls:
+            if len(out) >= limit:
+                break
+            provider = detect_provider(url)
+            dlog(f"URL provider={provider} → {url}")
+            try:
+                if provider == "greenhouse":
+                    slug = first_path_segment(url)
+                    if slug and slug not in processed_company_slugs["greenhouse"]:
+                        rows = parse_greenhouse_company_jobs(session, url, kw_re)
+                        processed_company_slugs["greenhouse"].add(slug)
+                        out.extend(rows)
+                        counts["greenhouse"] += len(rows)
 
-            elif provider == "lever":
-                slug = first_path_segment(url)
-                if slug and slug not in processed_company_slugs["lever"]:
-                    rows = parse_lever_company_jobs(session, url, kw_re)
-                    processed_company_slugs["lever"].add(slug)
-                    out.extend(rows)
-                    counts["lever"] += len(rows)
+                elif provider == "lever":
+                    slug = first_path_segment(url)
+                    if slug and slug not in processed_company_slugs["lever"]:
+                        rows = parse_lever_company_jobs(session, url, kw_re)
+                        processed_company_slugs["lever"].add(slug)
+                        out.extend(rows)
+                        counts["lever"] += len(rows)
 
-            elif provider == "ashby":
-                board = first_path_segment(url)
-                if board and board not in processed_company_slugs["ashby"]:
-                    rows = parse_ashby_company_jobs(session, url, kw_re)
-                    processed_company_slugs["ashby"].add(board)
-                    out.extend(rows)
-                    counts["ashby"] += len(rows)
-                # Fallback: single-page JSON-LD (only if needed)
-                if len(out) < limit:
+                elif provider == "ashby":
+                    board = first_path_segment(url)
+                    if board and board not in processed_company_slugs["ashby"]:
+                        rows = parse_ashby_company_jobs(session, url, kw_re)
+                        processed_company_slugs["ashby"].add(board)
+                        out.extend(rows)
+                        counts["ashby"] += len(rows)
+                    # Fallback: single-page JSON-LD (only if needed)
+                    if len(out) < limit:
+                        rows = parse_generic_page(session, url, kw_re)
+                        out.extend(rows)
+                        counts["generic"] += len(rows)
+
+                elif provider == "smartrecruiters":
+                    comp = first_path_segment(url)
+                    used_api = False
+                    if comp and comp not in processed_company_slugs["smartrecruiters"]:
+                        api_rows = parse_smartrecruiters_company_jobs_api(session, url, kw_re)
+                        if api_rows:
+                            out.extend(api_rows)
+                            counts["smartrecruiters"] += len(api_rows)
+                            used_api = True
+                        processed_company_slugs["smartrecruiters"].add(comp)
+                    if not used_api and len(out) < limit:
+                        rows = parse_generic_page(session, url, kw_re)
+                        out.extend(rows)
+                        counts["generic"] += len(rows)
+
+                else:
+                    # Workday / unknown → single-page JSON-LD
                     rows = parse_generic_page(session, url, kw_re)
                     out.extend(rows)
                     counts["generic"] += len(rows)
 
-            elif provider == "smartrecruiters":
-                comp = first_path_segment(url)
-                used_api = False
-                if comp and comp not in processed_company_slugs["smartrecruiters"]:
-                    api_rows = parse_smartrecruiters_company_jobs_api(session, url, kw_re)
-                    if api_rows:
-                        out.extend(api_rows)
-                        counts["smartrecruiters"] += len(api_rows)
-                        used_api = True
-                    processed_company_slugs["smartrecruiters"].add(comp)
-                if not used_api and len(out) < limit:
-                    rows = parse_generic_page(session, url, kw_re)
-                    out.extend(rows)
-                    counts["generic"] += len(rows)
+            except Exception as e:
+                log(f"Harvest error on {url}: {e}")
+                if DEBUG:
+                    traceback.print_exc(file=sys.stderr)
+                continue
 
-            else:
-                # Workday / unknown → single-page JSON-LD
-                rows = parse_generic_page(session, url, kw_re)
-                out.extend(rows)
-                counts["generic"] += len(rows)
+            # polite spacing between requests
+            time.sleep(BASE_SLEEP * 0.6)
 
-        except Exception as e:
-            log(f"Harvest error on {url}: {e}")
-            continue
+            if len(out) >= limit:
+                break
 
-        # polite spacing between requests
-        time.sleep(BASE_SLEEP * 0.6)
+        # Deduplicate by link (stable order)
+        seen_links: Set[str] = set()
+        unique: List[JobPosting] = []
+        for j in out:
+            if j.link not in seen_links:
+                unique.append(j)
+                seen_links.add(j.link)
 
-        if len(out) >= limit:
-            break
-
-    # Deduplicate by link (stable order)
-    seen_links: Set[str] = set()
-    unique: List[JobPosting] = []
-    for j in out:
-        if j.link not in seen_links:
-            unique.append(j)
-            seen_links.add(j.link)
-
-    log("---------- SUMMARY ----------")
-    log(f"Greenhouse: {counts['greenhouse']} | Lever: {counts['lever']} | Ashby: {counts['ashby']} | SmartRecruiters: {counts['smartrecruiters']} | HTML(JSON-LD): {counts['generic']}")
-    log(f"Total matches (pre-unique): {len(out)} → unique: {len(unique)}")
-    return unique[:limit]
+        log("---------- SUMMARY ----------")
+        log(f"Greenhouse: {counts['greenhouse']} | Lever: {counts['lever']} | Ashby: {counts['ashby']} | SmartRecruiters: {counts['smartrecruiters']} | HTML(JSON-LD): {counts['generic']}")
+        log(f"Total matches (pre-unique): {len(out)} → unique: {len(unique)}")
+        return unique[:limit]
 
 def write_csv(rows: List[JobPosting], out_path: str) -> None:
-    df = pd.DataFrame([{
-        "Company": r.company,
-        "Career portal link": r.link,
-        "Job title": r.title,
-        "Location": r.location
-    } for r in rows])
-    df.to_csv(out_path, index=False)
-    log(f"CSV written → {out_path} ({len(rows)} rows)")
+    with step("WRITE CSV"):
+        df = pd.DataFrame([{
+            "Company": r.company,
+            "Career portal link": r.link,
+            "Job title": r.title,
+            "Location": r.location
+        } for r in rows])
+        df.to_csv(out_path, index=False)
+        log(f"CSV written → {out_path} ({len(rows)} rows)")
 
 # ================================ Main ================================
 
@@ -680,41 +729,45 @@ def parse_args() -> argparse.Namespace:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--quiet", action="store_true", help="Suppress milestone logs")
     g.add_argument("--progress", action="store_true", help="Show milestone logs (default behavior)")
+    p.add_argument("--debug", type=str, default="false", help="Enable debugger mode: true|false (default false)")
     return p.parse_args()
 
 def main() -> None:
-    global PROGRESS
+    global PROGRESS, DEBUG
     args = parse_args()
-    PROGRESS = not args.quiet  # default True unless --quiet
+    DEBUG = parse_bool(args.debug)
+    PROGRESS = (not args.quiet) or DEBUG  # if debug, always show logs
 
-    # Start banner
-    log("========== START ==========")
-    log(f".env loaded: {'yes' if ENV_LOADED else 'no'}")
-    log(f"User-Agent: {DEFAULT_USER_AGENT}")
-    log(f"Allowed domains: {sorted(ATS_ALLOWED_DOMAINS)}")
+    with step("STARTUP"):
+        log(f".env loaded: {'yes' if ENV_LOADED else 'no'}")
+        log(f"User-Agent: {DEFAULT_USER_AGENT}")
+        log(f"Allowed domains: {sorted(ATS_ALLOWED_DOMAINS)}")
+        if DEBUG:
+            dlog(f"REQUEST_TIMEOUT={REQUEST_TIMEOUT}s BASE_SLEEP={BASE_SLEEP}s")
+            dlog(f"GOOGLE_CSE configured? {'yes' if (GOOGLE_CSE_KEY and GOOGLE_CSE_CX) else 'no'} | SERPAPI configured? {'yes' if SERPAPI_KEY else 'no'} | SMARTRECRUITERS token? {'yes' if SMARTRECRUITERS_TOKEN else 'no'}")
 
-    session = make_session()
+    with step("INIT SESSION"):
+        session = make_session()
 
-    # 1) Discover candidate posting URLs
-    discovered = discover_posting_urls(session, args.keywords, args.limit)
-    if not discovered:
-        log("No postings discovered via search (check GOOGLE_CSE_* or SERPAPI_KEY)")
-        print("No postings discovered via search (check GOOGLE_CSE_* or SERPAPI_KEY).", file=sys.stderr)
-        sys.exit(2)
+    with step("DISCOVER URLS"):
+        discovered = discover_posting_urls(session, args.keywords, args.limit)
+        if not discovered:
+            log("No postings discovered via search (check GOOGLE_CSE_* or SERPAPI_KEY).")
+            print("No postings discovered via search (check GOOGLE_CSE_* or SERPAPI_KEY).", file=sys.stderr)
+            sys.exit(2)
 
-    # 2) Harvest jobs using provider APIs or page JSON-LD fallbacks
     rows = harvest_jobs(session, discovered, args.keywords, args.limit)
     if not rows:
         log("No matching jobs found after parsing.")
         print("No matching jobs found after parsing.", file=sys.stderr)
         sys.exit(3)
 
-    # 3) Write CSV
     write_csv(rows, args.out)
 
-    # 4) Print Markdown table of top N to stdout (keep logs on stderr)
-    print(to_markdown_table(rows, min(len(rows), args.limit)))
-    log("========== DONE ==========")
+    with step("PRINT TABLE"):
+        print(to_markdown_table(rows, min(len(rows), args.limit)))
+
+    log("DONE ✅")
     log(f"Saved CSV: {args.out}")
 
 if __name__ == "__main__":
@@ -747,25 +800,23 @@ USAGE
        SMARTRECRUITERS_API_TEMPLATE=https://api.smartrecruiters.com/v1/companies/{company}/postings?limit=100&offset=0
 
        # Politeness / runtime
-       JOBS_USER_AGENT=ReactJobsFinderBot/1.3 (+https://yourdomain.example/jobsfinder; contact: mailto:you@example.com)
+       JOBS_USER_AGENT=ReactJobsFinderBot/1.4 (+https://yourdomain.example/jobsfinder; contact: mailto:you@example.com)
        REQUEST_TIMEOUT_SECONDS=20
        BASE_SLEEP_SECONDS=1.0
 
 1) Install dependencies (Python 3.9+):
    pip install requests beautifulsoup4 pandas
 
-2) Run:
-   # Show milestone logs (default)
+2) Run (progress on stderr, results to stdout):
    python3 react_jobs_finder.py --keywords React "React Native" --limit 50 --out jobs.csv
-   # Suppress progress logs:
+
+3) Debugger mode (more logs + tracebacks):
+   python3 react_jobs_finder.py --debug=true --limit 20
+
+4) Quiet mode (minimal logs):
    python3 react_jobs_finder.py --quiet --limit 50
 
-3) Output:
-   - CSV file: Company | Career portal link | Job title | Location
-   - Markdown table printed to stdout (keep logs to stderr).
-
-Notes
-- **Discovery**: Google CSE (100/day free) → SerpAPI fallback.
-- **Ethical scraping**: Respects robots.txt for HTML; uses official ATS APIs where available.
-- **Progress**: Milestones are timestamped; only the Markdown table goes to stdout so you can pipe it cleanly.
+Output:
+- CSV file: Company | Career portal link | Job title | Location
+- Markdown table printed to stdout (clean to pipe into README/notes).
 """
