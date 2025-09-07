@@ -40,6 +40,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from urllib import robotparser
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 
 import pandas as pd
 import requests
@@ -87,6 +90,10 @@ def _require_list(name: str) -> List[str]:
 def _parse_bool(s: str) -> bool:
     return s.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
+# Date and Time zone for output file
+OUT_DATE_FMT: str
+OUT_TZ: str
+
 # Populated by init_config()
 JOBS_USER_AGENT: str
 HTTP_ACCEPT_LANGUAGE: str
@@ -131,6 +138,11 @@ def init_config() -> None:
     global SERPAPI_ENDPOINT, SERPAPI_ENGINE, SERPAPI_KEY
     global ATS_PROVIDERS, GREENHOUSE_API_TEMPLATE, LEVER_API_TEMPLATE, ASHBY_API_TEMPLATE, SMARTRECRUITERS_API_TEMPLATE, SMARTRECRUITERS_TOKEN
     global DEFAULT_LIMIT, DEFAULT_OUT_PATH, DEFAULT_KEYWORDS
+
+    # Date and Time zone (from env)
+    global OUT_TZ, OUT_DATE_FMT
+    OUT_DATE_FMT = _require("OUT_DATE_FMT")
+    OUT_TZ = _require("OUT_TZ")
 
     # Core runtime
     JOBS_USER_AGENT = _require("JOBS_USER_AGENT")
@@ -285,12 +297,12 @@ def safe_get_html(session: requests.Session, url: str, headers: Dict[str, str]) 
             sleep_with_backoff(attempt)
     return None
 
-def to_markdown_table(rows: List[JobPosting], limit: int) -> str:
-    cols = ["Company", "Career portal link", "Job title", "Location"]
-    head = "| " + " | ".join(cols) + " |"
-    sep = "| " + " | ".join(["---"] * len(cols)) + " |"
-    body = [f"| {r.company} | {r.link} | {r.title} | {r.location} |" for r in rows[:limit]]
-    return "\n".join([head, sep] + body)
+# def to_markdown_table(rows: List[JobPosting], limit: int) -> str:
+#     cols = ["Company", "Career portal link", "Job title", "Location"]
+#     head = "| " + " | ".join(cols) + " |"
+#     sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+#     body = [f"| {r.company} | {r.link} | {r.title} | {r.location} |" for r in rows[:limit]]
+#     return "\n".join([head, sep] + body)
 
 def normalize_domain(url: str) -> str:
     return urlparse(url).netloc.lower()
@@ -313,6 +325,12 @@ def first_path_segment(url: str) -> str:
 
 def fmt(template: str, **kwargs: str) -> str:
     return template.format(**kwargs)
+
+def expand_out_path(template: str, tz: str, fmt: str) -> str:
+    """Replace {date} with today's date in OUT_TZ using OUT_DATE_FMT."""
+    now = datetime.now(ZoneInfo(tz))
+    return template.replace("{date}", now.strftime(fmt))
+
 
 # ============================ Search layer ============================
 
@@ -533,7 +551,7 @@ def parse_jsonld_jobposting(html: str) -> Optional[Tuple[str, str, str]]:
     return None
 
 def parse_generic_page(session: requests.Session, url: str, kw_re: re.Pattern) -> List[JobPosting]:
-    log(f"HTML parse: {url}")
+    # log(f"HTML parse: {url}")
     html = safe_get_html(session, url, headers={"User-Agent": JOBS_USER_AGENT})
     if not html: return []
     extracted = parse_jsonld_jobposting(html)
@@ -628,13 +646,13 @@ def write_csv(rows: List[JobPosting], out_path: str) -> None:
 def parse_args() -> argparse.Namespace:
     # Defaults are env-driven to avoid in-script constants
     default_limit = int(os.environ.get("DEFAULT_LIMIT", "50"))
-    default_out   = os.environ.get("DEFAULT_OUT_PATH", "react_jobs.csv")
+    default_out_template = _require("DEFAULT_OUT_PATH")
     default_keywords = [x.strip() for x in os.environ.get("DEFAULT_KEYWORDS", "React,React Native").split(",") if x.strip()]
 
     p = argparse.ArgumentParser(description="Find current React/React Native job openings from ATS providers.")
     p.add_argument("--keywords", nargs="+", default=default_keywords, help="Keywords to match in job titles")
     p.add_argument("--limit", type=int, default=default_limit, help="Maximum number of results to output")
-    p.add_argument("--out", type=str, default=default_out, help="Path to write CSV output")
+    p.add_argument("--out", type=str, default=default_out_template, help="Path to write CSV output (supports {date})")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--quiet", action="store_true", help="Suppress milestone logs")
     g.add_argument("--progress", action="store_true", help="Show milestone logs (default behavior)")
@@ -670,14 +688,17 @@ def main() -> None:
         log("No matching jobs found after parsing.")
         print("No matching jobs found after parsing.", file=sys.stderr)
         sys.exit(3)
+    
+    # Write CSV
+    out_path = expand_out_path(args.out, OUT_TZ, OUT_DATE_FMT)
+    write_csv(rows, out_path)
 
-    write_csv(rows, args.out)
-
-    with step("PRINT TABLE"):
-        print(to_markdown_table(rows, min(len(rows), args.limit)))
+    # Print markdown table to stdout (capped by --limit)
+    # with step("PRINT TABLE"):
+    #     print(to_markdown_table(rows, min(len(rows), args.limit)))
 
     log("DONE ✅")
-    log(f"Saved CSV: {args.out}")
+    log(f"Saved CSV: {out_path}")
 
 if __name__ == "__main__":
     main()
