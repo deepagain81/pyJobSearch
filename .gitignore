@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE-specific files
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Sensitive configuration files (example)
+config.py
+.env
+
+#others
+.DS_Store
+
